@@ -29,15 +29,18 @@
 
 // ------------------------------------------------------------ Private settings
 
-
 // Size of the control sequence buffer. There is no upper bound specified
 // in a standard, but we can assume that we won't have to process any of the
 // really complex ones. That is mostly the terminals problem
 #define CS_BUFFER_SIZE                  16
 
+// Default command prompt. This is a raw string, and will not go through
+// normal special character replacement before being written out (for
+// performance reasons)
+#define DEFAULT_PROMPT                  " # "
+
 
 // -------------------------------------------------------------- Private types
-
 
 typedef void (*console_state_fn)(struct ecdc_console *);
 
@@ -76,7 +79,7 @@ struct ecdc_console {
 
     // Console read / write
     ecdc_getc_fn                        getc;
-    ecdc_putc_fn                        putc;
+    ecdc_puts_fn                        puts;
     void *                              hint;
     int                                 snoop_char;
 
@@ -93,10 +96,31 @@ struct ecdc_console {
     // Flags and settings
     bool                                f_local_echo;
     enum ecdc_mode                      mode;
+
+    // Prompt
+    char  *                             prompt;
 };
 
 
 // ---------------------------------------------------------- Private functions
+
+static inline char *
+ecdc_strdup(const char * s)
+{
+    #if defined(strdup)
+        return strdup(s);
+    #else
+        char * new_s = NULL;
+        if(NULL != s) {
+            size_t len = strlen(s) + 1;
+            new_s = malloc(len);
+            if(NULL != new_s) {
+                memcpy(new_s, s, len);
+            }
+        }
+        return new_s;
+    #endif
+}
 
 
 static struct ecdc_command *
@@ -118,7 +142,6 @@ locate_command(struct ecdc_console * console,
     return ret;
 }
 
-
 static struct ecdc_command *
 get_last_command(struct ecdc_console * console)
 {
@@ -137,7 +160,6 @@ get_last_command(struct ecdc_console * console)
 
     return last_command;
 }
-
 
 static struct ecdc_command *
 get_previous_command(struct ecdc_command * command)
@@ -170,7 +192,6 @@ get_previous_command(struct ecdc_command * command)
     return prev;
 }
 
-
 static void
 register_command(struct ecdc_console * console,
                  struct ecdc_command * command)
@@ -188,7 +209,6 @@ register_command(struct ecdc_console * console,
         }
     }
 }
-
 
 static void
 unregister_command(struct ecdc_command * command)
@@ -219,7 +239,6 @@ unregister_command(struct ecdc_command * command)
     } while(0);
 }
 
-
 static char *
 find_first_non_whitesapce(char * str)
 {
@@ -247,7 +266,6 @@ find_first_non_whitesapce(char * str)
     out:
         return out_ptr;
 }
-
 
 static char *
 find_fist_whitespace(char * str)
@@ -285,10 +303,9 @@ find_fist_whitespace(char * str)
 static void
 term_put_ansi_newline(struct ecdc_console * console)
 {
-    console->putc(console->hint, '\r');
-    console->putc(console->hint, '\n');
+    const char * newline_seq = "\r\n";
+    console->puts(console->hint, newline_seq, 2);
 }
-
 
 static inline void
 term_put_newline(struct ecdc_console * console)
@@ -307,11 +324,9 @@ term_put_newline(struct ecdc_console * console)
 static inline void
 term_backspace_ansi(struct ecdc_console * console)
 {
-    console->putc(console->hint, '\x08'); // BS
-    console->putc(console->hint, '\x20'); // SP
-    console->putc(console->hint, '\x08'); // BS
+    const char * backspace_seq = "\x08\x20\x08"; // BS, SP, BS
+    console->puts(console->hint, backspace_seq, 3);
 }
-
 
 static inline void
 term_backspace(struct ecdc_console * console)
@@ -330,20 +345,40 @@ term_backspace(struct ecdc_console * console)
 static void
 term_puts(struct ecdc_console * console, const char * str)
 {
-    if(NULL != str) {
-        while(*str != '\0') {
-            if('\n' == *str) {
-                term_put_newline(console);
-            } else if('\x08' == *str) {
-                term_backspace(console);
-            } else {
-                console->putc(console->hint, *str);
+    if(NULL == str) {
+        return;
+    }
+
+    while(*str != '\0') {
+        bool seq_end_with_nl = false;
+        bool seq_end_with_bs = false;
+
+        const char * end_seq;
+        for(end_seq = str; *end_seq != '\0'; ++end_seq) {
+            if('\n' == *end_seq) {
+                seq_end_with_nl = true;
+                break;
+            } else if('\x08' == *end_seq) {
+                seq_end_with_bs = true;
+                break;
             }
+        }
+
+        if(end_seq != str) {
+            size_t seq_len = end_seq - str;
+            console->puts(console->hint, str, seq_len);
+            str = end_seq;
+        }
+
+        if(seq_end_with_nl) {
+            term_put_newline(console);
+            ++str;
+        } else if(seq_end_with_bs) {
+            term_backspace(console);
             ++str;
         }
     }
 }
-
 
 static inline void
 term_putc(struct ecdc_console * console, char c)
@@ -353,27 +388,20 @@ term_putc(struct ecdc_console * console, char c)
     } else if('\x08' == c) {
         term_backspace(console);
     } else {
-        console->putc(console->hint, c);
+        console->puts(console->hint, &c, 1);
     }
 }
-
 
 static inline void
-term_puts_raw(struct ecdc_console * console, const char * str)
+term_puts_raw(struct ecdc_console * console, const char * s, size_t len)
 {
-    if(NULL != str) {
-        while(*str != '\0') {
-            console->putc(console->hint, *str);
-            ++str;
-        }
-    }
+    console->puts(console->hint, s, len);
 }
-
 
 static inline void
 term_putc_raw(struct ecdc_console * console, char c)
 {
-    console->putc(console->hint, c);
+    console->puts(console->hint, &c, 1);
 }
 
 
@@ -392,7 +420,6 @@ term_getc_raw(struct ecdc_console * console)
     return ret;
 }
 
-
 static inline void
 term_set_snoop_char(struct ecdc_console * console, char c)
 {
@@ -402,10 +429,8 @@ term_set_snoop_char(struct ecdc_console * console, char c)
 
 // ---------------------------------------------------- State machine functions
 
-
 static void
 state_start_new_command(struct ecdc_console * console);
-
 
 static void
 state_read_input(struct ecdc_console * console);
@@ -418,7 +443,6 @@ state_parse_escape_sequence_ansi(struct ecdc_console * console)
     // This would be a great spot to handle arrow keys
     console->state = state_read_input;
 }
-
 
 static void
 state_read_escape_sequence(struct ecdc_console * console)
@@ -486,22 +510,9 @@ state_read_escape_sequence(struct ecdc_console * console)
     }
 }
 
-
 static void
 state_parse_input(struct ecdc_console * console)
 {
-    if(NULL == console) {
-        return;
-    }
-
-    // Clear argv
-    {
-        size_t i;
-        for(i = 0; i < console->max_argc; ++i) {
-            console->argv[i] = NULL;
-        }
-    }
-
     // Split
     size_t argc = 0;
     {
@@ -529,6 +540,14 @@ state_parse_input(struct ecdc_console * console)
         }
     }
 
+    // Clear the rest of argv
+    {
+        size_t i;
+        for(i = argc; i < console->max_argc; ++i) {
+            console->argv[i] = NULL;
+        }
+    }
+
     // Search for handler
     if(argc > 0) {
         struct ecdc_command * command = locate_command(console, console->argv[0]);
@@ -544,7 +563,6 @@ state_parse_input(struct ecdc_console * console)
 
     console->state = state_start_new_command;
 }
-
 
 static void
 state_read_input(struct ecdc_console * console)
@@ -595,7 +613,6 @@ state_read_input(struct ecdc_console * console)
     }
 }
 
-
 static void
 state_start_new_command(struct ecdc_console * console)
 {
@@ -611,11 +628,18 @@ state_start_new_command(struct ecdc_console * console)
     }
 
     // Set new state to read user input
-    // TODO: Make the prompt configurable
-    term_puts(console, " # ");
+    if(NULL == console->prompt)
+    {
+        term_puts_raw(console, DEFAULT_PROMPT,
+            sizeof(DEFAULT_PROMPT) / sizeof(*DEFAULT_PROMPT));
+    }
+    else
+    {
+        term_puts(console, console->prompt);
+    }
+
     console->state = state_read_input;
 }
-
 
 static void
 state_wait_for_client(struct ecdc_console * console)
@@ -628,9 +652,7 @@ state_wait_for_client(struct ecdc_console * console)
 }
 
 
-
 // ---------------------------------------------------------- Build in commands
-
 
 static void
 built_in_list_command(void * hint, int argc, char const * argv[])
@@ -650,11 +672,10 @@ built_in_list_command(void * hint, int argc, char const * argv[])
 
 // ----------------------------------------------------------- Public functions
 
-
 struct ecdc_console *
 ecdc_alloc_console(void * console_hint,
                    ecdc_getc_fn getc_fn,
-                   ecdc_putc_fn putc_fn,
+                   ecdc_puts_fn puts_fn,
                    size_t max_arg_line_length,
                    size_t max_arg_count)
 {
@@ -666,10 +687,11 @@ ecdc_alloc_console(void * console_hint,
 
     console->root = NULL;
     console->getc = getc_fn;
-    console->putc = putc_fn;
+    console->puts = puts_fn;
     console->hint = console_hint;
     console->snoop_char = ECDC_GETC_EOF;
     console->state = state_wait_for_client;
+    console->prompt = NULL;
 
     if(max_arg_line_length < 16) {
         max_arg_line_length = 16;
@@ -725,7 +747,6 @@ ecdc_alloc_console(void * console_hint,
         return console;
 }
 
-
 void
 ecdc_free_console(struct ecdc_console * console)
 {
@@ -736,10 +757,10 @@ ecdc_free_console(struct ecdc_console * console)
 
         free(console->argv);
         free(console->arg_line);
+        free(console->prompt);
         free(console);
     }
 }
-
 
 void
 ecdc_pump_console(struct ecdc_console * console)
@@ -749,7 +770,6 @@ ecdc_pump_console(struct ecdc_console * console)
         console->state(console);
     }
 }
-
 
 void
 ecdc_configure_console(struct ecdc_console * console,
@@ -763,7 +783,22 @@ ecdc_configure_console(struct ecdc_console * console,
     }
 }
 
+void
+ecdc_replace_prompt(struct ecdc_console *console,
+                    char const *prompt)
+{
+    if(NULL != console) {
+        // If the prompt was previously not set, it will be NULL which will not
+        // have any ill side effects when calling free
+        free(console->prompt);
 
+        if(NULL != prompt) {
+            console->prompt = ecdc_strdup(prompt);
+        } else {
+            console->prompt = NULL;
+        }
+    }
+}
 
 struct ecdc_command *
 ecdc_alloc_command(void * command_hint,
@@ -792,14 +827,13 @@ ecdc_alloc_command(void * command_hint,
         command->callback = callback;
         command->hint = command_hint;
 
-        command->name = strdup(command_name);
+        command->name = ecdc_strdup(command_name);
 
         register_command(console, command);
     } while(0);
 
     return command;
 }
-
 
 void
 ecdc_free_command(struct ecdc_command * command)
@@ -812,7 +846,6 @@ ecdc_free_command(struct ecdc_command * command)
     }
 }
 
-
 struct ecdc_command *
 ecdc_alloc_list_command(struct ecdc_console * console,
                         const char * command_name)
@@ -823,8 +856,6 @@ ecdc_alloc_list_command(struct ecdc_console * console,
                               built_in_list_command);
 }
 
-
-
 void
 ecdc_putc(struct ecdc_console * console, char c)
 {
@@ -833,7 +864,6 @@ ecdc_putc(struct ecdc_console * console, char c)
     }
 }
 
-
 void
 ecdc_puts(struct ecdc_console * console, const char * str)
 {
@@ -841,4 +871,3 @@ ecdc_puts(struct ecdc_console * console, const char * str)
         term_puts(console, str);
     }
 }
-
