@@ -25,7 +25,6 @@
 #include <string.h>
 
 #include "ecdc.h"
-#include "strdup/strdup.h"
 
 
 // ------------------------------------------------------------ Private settings
